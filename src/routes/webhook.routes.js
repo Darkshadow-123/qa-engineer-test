@@ -4,8 +4,29 @@ import { getPaymentById, db } from '../db/database.js';
 
 const router = express.Router();
 
-// Webhook secret for HMAC verification
-const WEBHOOK_SECRET = 'test-webhook-secret-key';
+// Webhook secret for HMAC verification (override via environment in real deployments)
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'test-webhook-secret-key';
+
+/**
+ * Verify the HMAC-SHA256 signature of a webhook request.
+ * Signs the raw request bytes when available (what providers actually sign), falling back to
+ * the re-serialised body. Uses a constant-time comparison to avoid timing attacks.
+ */
+function isValidSignature(req, signature) {
+  if (typeof signature !== 'string' || signature.length === 0) return false;
+
+  const payload = req.rawBody ?? Buffer.from(JSON.stringify(req.body));
+  const expected = crypto
+    .createHmac('sha256', WEBHOOK_SECRET)
+    .update(payload)
+    .digest('hex');
+
+  // Compare as UTF-8 buffers of the hex strings. (Decoding the header as hex would silently
+  // drop invalid trailing characters.) timingSafeEqual throws on length mismatch, so check first.
+  const provided = Buffer.from(signature);
+  const wanted = Buffer.from(expected);
+  return provided.length === wanted.length && crypto.timingSafeEqual(provided, wanted);
+}
 
 /**
  * POST /api/webhooks/payment-status
@@ -18,30 +39,26 @@ router.post('/payment-status', (req, res) => {
     const signature = req.headers['x-webhook-signature'];
     const { payment_id, status, event_id } = req.body;
 
-    // BUG D: No signature verification
-    // Real systems MUST verify webhook signatures to prevent spoofing
-    // Missing validation below:
-    
-    // const expectedSignature = crypto
-    //   .createHmac('sha256', WEBHOOK_SECRET)
-    //   .update(JSON.stringify(req.body))
-    //   .digest('hex');
-    // 
-    // if (signature !== expectedSignature) {
-    //   return res.status(401).json({ error: 'Invalid signature' });
-    // }
+    // FIX (Bug D): reject unsigned or incorrectly signed webhooks before touching any data
+    if (!signature) {
+      return res.status(401).json({ error: 'Webhook signature required' });
+    }
+    if (!isValidSignature(req, signature)) {
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
 
     if (!payment_id || !status) {
       return res.status(400).json({ error: 'payment_id and status required' });
     }
 
-    // BUG E: No idempotency check
-    // Webhooks can be delivered multiple times - must be idempotent
-    // Missing check below:
-    
-    // if (db.processed_webhooks.includes(event_id)) {
-    //   return res.status(200).json({ message: 'Already processed' });
-    // }
+    // FIX (Bug E): webhooks can be delivered more than once - acknowledge duplicates
+    // (200 so the provider stops retrying) without re-applying the state change.
+    if (!event_id) {
+      return res.status(400).json({ error: 'event_id required' });
+    }
+    if (db.processed_webhooks.includes(event_id)) {
+      return res.status(200).json({ success: true, message: 'Already processed', event_id });
+    }
 
     const payment = getPaymentById(payment_id);
     if (!payment) {
@@ -52,8 +69,10 @@ router.post('/payment-status', (req, res) => {
     payment.status = status;
     payment.webhook_received_at = new Date();
 
-    // Mark webhook as processed (if idempotency was implemented)
-    // db.processed_webhooks.push(event_id);
+    // Record the event only after the update succeeded, so a webhook that failed
+    // (e.g. payment not found yet) can still be retried by the provider.
+    // No await between the check above and this push, so it is atomic in Node's event loop.
+    db.processed_webhooks.push(event_id);
 
     res.status(200).json({
       success: true,

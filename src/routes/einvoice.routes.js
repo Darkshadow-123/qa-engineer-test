@@ -47,15 +47,13 @@ router.post('/submit', authenticate, async (req, res) => {
       });
     }
 
-    // BUG G: No duplicate submission check
-    // Should prevent submitting the same invoice twice
-    // Missing validation below:
-    
-    // if (invoice.einvoice_status === 'submitted' || invoice.einvoice_status === 'accepted') {
-    //   return res.status(409).json({ 
-    //     error: 'Invoice already submitted to tax authority' 
-    //   });
-    // }
+    // FIX (Bug G): an invoice may only be filed once. Runs after the ownership check so
+    // other merchants cannot probe submission state, and before a new submission_id is issued.
+    if (invoice.einvoice_status === 'submitted' || invoice.einvoice_status === 'accepted') {
+      return res.status(409).json({
+        error: 'Invoice already submitted to tax authority'
+      });
+    }
 
     // Simulate tax authority submission
     const submission_id = `SUB-${uuidv4()}`;

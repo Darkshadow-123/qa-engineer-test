@@ -22,7 +22,12 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+// Keep the raw request bytes so webhook HMAC signatures are verified against what was actually sent
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 
 // Initialize database
 initDatabase();
